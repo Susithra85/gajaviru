@@ -1,0 +1,143 @@
+pipeline {
+    agent any
+  parameters {
+  string 'GIT_BRANCH'
+  string 'GIT_URL'
+  string 'AWS_ACCOUNT'
+  string 'CLUSTER'
+}
+    stages {
+        stage('Git Checkout') {
+            steps {
+                gitcheckout()
+            }
+        }
+        stage('Get nodes') {
+            steps {
+                withAWS(roleAccount:"$AWS_ACCOUNT" , role:'Jenkins-Role') {
+                getnodes()
+                }
+            }
+        }
+       stage('Copy Informix driver') {
+            steps {
+               sh 'cp /var/lib/jenkins/workspace/Informix_Client-SDK.tar.gz  /var/lib/jenkins/workspace/$JOB_NAME/airflowdockerconfig/czr-drivers/'
+                }
+
+             }
+        stage('update yaml file with build id') { 
+            steps {
+                addbuildid()           
+        }
+    }
+        stage ('push yaml file to git'){
+            steps {
+                sshagent (credentials: ['6606affd-8ed7-4e22-9f1f-d78921ef138b']) {
+                    gitcommit()
+                }
+            }
+        }
+
+        stage('Git Checkout updated file') {
+            steps {
+                checkoutupdatedfile()
+        }
+    }     
+        stage('docker build') {
+            steps {
+                dockerbuild()
+        }
+    }
+
+        stage('Login to shared ECR') {
+            steps {
+                dockerlogin()
+          }
+       } 
+
+        stage('tag docker image'){
+            steps{
+                dockertag()
+            }
+        }
+
+        stage('docker push to ECR'){
+            steps {
+                dockerpush()
+            }
+        }
+
+        stage('helm uninstall') {
+            steps {
+                withAWS(roleAccount:"$AWS_ACCOUNT" , role:'Jenkins-Role') {
+                    helmuninstall()
+                }  
+            }
+        }
+        stage('wait 60s') {
+            steps {
+                sh 'sleep 60s'
+            }
+        }
+        stage('helm install') {
+            steps {
+                withAWS(roleAccount:"$AWS_ACCOUNT" , role:'Jenkins-Role') {
+                    helminstall()
+                }
+            }
+        } 
+    }
+}
+
+def gitcheckout(){
+        git branch: '$GIT_BRANCH', credentialsId: '6606affd-8ed7-4e22-9f1f-d78921ef138b', url: '$GIT_URL'
+    }
+def getnodes(){
+
+        sh 'aws eks --region us-west-2 update-kubeconfig --name czr-"$CLUSTER"-usw2-daas-ekscluster'
+        sh 'kubectl get nodes'
+       // sh 'export PATH="/usr/local/bin:$PATH" && cd helm && helm uninstall airflow'
+    }    
+def addbuildid(){
+        sh 'cd helm/airflow && sed -i \'s/.*imageVersion.*/  imageVersion: \'$BUILD_ID\'/\' values.yaml' 
+    }
+def gitcommit(){
+        sh 'cd helm/airflow && git add values.yaml'
+        sh 'cd helm/airflow && git commit -m "updated values.yaml with build id"'
+        sh 'cd helm/airflow && git push git@code.caesars-dev.com:Data-as-a-Service/DAAS_REPO.git'
+    }
+def checkoutupdatedfile(){
+        git branch: '$GIT_BRANCH', credentialsId: '6606affd-8ed7-4e22-9f1f-d78921ef138b', url: '$GIT_URL'
+    }
+def dockerbuild(){
+        sh 'docker build --rm -t apache-airflow airflowdockerconfig/'
+    }
+
+def dockerlogin(){
+        sh  'aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 586467197160.dkr.ecr.us-west-2.amazonaws.com'
+    }
+
+def dockertag(){
+        sh  'docker tag apache-airflow 586467197160.dkr.ecr.us-west-2.amazonaws.com/czr-qa-usw2-daas-apacheairflow:$BUILD_ID'
+    }
+
+def dockerpush(){
+        sh   'docker push 586467197160.dkr.ecr.us-west-2.amazonaws.com/czr-qa-usw2-daas-apacheairflow:$BUILD_ID'
+    }
+
+def helmuninstall(){
+        //sh 'CLUSTER=$(echo "$GIT_BRANCH" | tr [:upper:] [:lower:])'
+        //sh 'echo $CLUSTER'
+        sh "aws eks --region us-west-2 update-kubeconfig --name czr-'$CLUSTER'-usw2-daas-ekscluster"
+        sh 'export PATH="/usr/local/bin:$PATH" && cd helm && helm uninstall airflow'
+    }
+
+def helminstall(){
+        //sh 'CLUSTER=$(echo "$GIT_BRANCH" | tr [:upper:] [:lower:])'
+        sh "aws eks --region us-west-2 update-kubeconfig --name czr-'$CLUSTER'-usw2-daas-ekscluster"
+        sh 'rm -f /var/lib/jenkins/workspace/$JOB_NAME/helm/airflow/charts/*'
+        //sh 'kubectl create namespace airflow'
+        //sh 'kubectl apply -f /var/lib/jenkins/workspace/$JOB_NAME/helm/airflow/eks-admin-service-account.yaml'
+        //sh 'kubectl apply -f /var/lib/jenkins/workspace/$JOB_NAME/helm/airflow/scheduler-service-account.yaml'
+        sh 'export PATH="/usr/local/bin:$PATH" && cd /var/lib/jenkins/workspace/$JOB_NAME/helm/ && helm install airflow airflow'
+     }
